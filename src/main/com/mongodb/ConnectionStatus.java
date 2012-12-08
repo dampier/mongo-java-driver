@@ -100,10 +100,14 @@ abstract class ConnectionStatus {
     }
 
     static class Node {
-
         Node(float pingTime, ServerAddress addr, int maxBsonObjectSize, boolean ok) {
+            this(pingTime, addr, null, maxBsonObjectSize, ok);
+        }
+
+        Node(float pingTime, ServerAddress addr, ServerAddress altAddr, int maxBsonObjectSize, boolean ok) {
             this._pingTime = pingTime;
             this._addr = addr;
+            this._altAddr = altAddr;
             this._maxBsonObjectSize = maxBsonObjectSize;
             this._ok = ok;
         }
@@ -117,10 +121,16 @@ abstract class ConnectionStatus {
         }
 
         public ServerAddress getServerAddress() {
-            return _addr;
+            if ( _altAddr == null )
+                return _addr;
+            else
+                return _altAddr;
         }
 
+        public ServerAddress getNominalServerAddress() { return _addr; }
+
         protected final ServerAddress _addr;
+        protected final ServerAddress _altAddr;
         protected final float _pingTime;
         protected final boolean _ok;
         protected final int _maxBsonObjectSize;
@@ -135,14 +145,21 @@ abstract class ConnectionStatus {
             if (_maxBsonObjectSize != node._maxBsonObjectSize) return false;
             if (_ok != node._ok) return false;
             if (Float.compare(node._pingTime, _pingTime) != 0) return false;
-            if (!_addr.equals(node._addr)) return false;
+            return isHavingSameAddrs( node );
+        }
 
-            return true;
+        protected boolean isHavingSameAddrs( Node node ) {
+            if ( !_addr.equals( node._addr ) ) return false;
+            if ( _altAddr == null )
+                return node._altAddr == null;
+            else
+                return _altAddr.equals(node._altAddr);
         }
 
         @Override
         public int hashCode() {
             int result = _addr.hashCode();
+            result = 31 * result + (_altAddr == null ? 0 : _altAddr.hashCode());
             result = 31 * result + (_pingTime != +0.0f ? Float.floatToIntBits(_pingTime) : 0);
             result = 31 * result + (_ok ? 1 : 0);
             result = 31 * result + _maxBsonObjectSize;
@@ -153,6 +170,8 @@ abstract class ConnectionStatus {
             StringBuilder buf = new StringBuilder();
             buf.append("{");
             buf.append("address:'").append(_addr).append("', ");
+            if ( _altAddr != null )
+                buf.append( "altAddress:'" ).append( _altAddr ).append( "', " );
             buf.append("ok:").append(_ok).append(", ");
             buf.append("ping:").append(_pingTime).append(", ");
             buf.append("maxBsonObjectSize:").append(_maxBsonObjectSize).append(", ");
@@ -171,10 +190,27 @@ abstract class ConnectionStatus {
 
     static abstract class UpdatableNode {
         UpdatableNode(final ServerAddress addr, Mongo mongo, MongoOptions mongoOptions) {
+            this( addr, null, mongo, mongoOptions );
+        }
+
+        UpdatableNode( final ServerAddress addr, ServerAddress altAddr, Mongo mongo, MongoOptions mongoOptions ) {
             this._addr = addr;
+            this._altAddr = altAddr;
             this._mongo = mongo;
             this._mongoOptions = mongoOptions;
             this._port = new DBPort(addr, null, mongoOptions);
+        }
+
+        public ServerAddress getServerAddress() {
+            if ( _altAddr == null )
+                return _addr;
+            else
+                return _altAddr;
+        }
+
+        public String getHostAddrDesc() {
+            return ( _addr +
+                     ( _altAddr != null ? " (at " + _altAddr + ")" : "" ) );
         }
 
         public CommandResult update() {
@@ -189,7 +225,7 @@ abstract class ConnectionStatus {
                 else
                     _pingTimeMS = _pingTimeMS + ((newPingMS - _pingTimeMS) / latencySmoothFactor);
 
-                getLogger().log(Level.FINE, "Latency to " + _addr + " actual=" + newPingMS + " smoothed=" + _pingTimeMS);
+                getLogger().log(Level.FINE, "Latency to " + getServerAddress() + " actual=" + newPingMS + " smoothed=" + _pingTimeMS);
 
                 successfullyContacted = true;
 
@@ -198,7 +234,7 @@ abstract class ConnectionStatus {
                 }
 
                 if (!_ok) {
-                    getLogger().log(Level.INFO, "Server seen up: " + _addr);
+                    getLogger().log( Level.INFO, "Server seen up: " + getHostAddrDesc() );
                 }
                 _ok = true;
 
@@ -213,7 +249,7 @@ abstract class ConnectionStatus {
                     return res;
                 }
 
-                final StringBuilder logError = (new StringBuilder("Server seen down: ")).append(_addr);
+                final StringBuilder logError = ( new StringBuilder("Server seen down: ") ).append( getHostAddrDesc() );
 
                 if (e instanceof IOException) {
 
@@ -237,6 +273,7 @@ abstract class ConnectionStatus {
         protected abstract Logger getLogger();
 
         final ServerAddress _addr;
+        ServerAddress _altAddr;
         final MongoOptions _mongoOptions;
         final Mongo _mongo;
 
