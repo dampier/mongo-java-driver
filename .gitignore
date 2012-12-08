@@ -18,6 +18,12 @@ commit-*
 *.swp
 .MQLshell
 
+# mongolab stuff
+JContLoop
+lib
+out
+*.iml
+
 #os x stuff
 *Thumbs.db*
 *.DS_Store
