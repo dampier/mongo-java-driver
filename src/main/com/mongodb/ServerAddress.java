@@ -95,11 +95,21 @@ public class ServerAddress {
      * @param addr inet socket address containing hostname and port
      */
     public ServerAddress( InetSocketAddress addr ){
-        _address = addr;
+        _address = new InetSocketAddress( addrHackAddr( addr ), addr.getPort() );
         _host = _address.getHostName();
         _port = _address.getPort();
     }
-    
+
+    public static InetAddress addrHackAddr( InetSocketAddress addr ) {
+        try {
+            // sometimes maybe this is where we turn "localhost" into loopback address.  thanks, _getAddress()!
+            InetAddress[] hackedHostAddrses = _getAddress( addr.getHostName() );
+            return hackedHostAddrses[0];
+        } catch ( Exception uheOrWhatever ) {
+            return addr.getAddress();   // well, we tried.
+        }
+    }
+
     // --------
     // equality, etc...
     // --------
@@ -179,6 +189,25 @@ public class ServerAddress {
     // static helpers
     // --------
 
+    static boolean localhostIsLoopback;
+    static {
+        // this will get you the behavior of the Java driver as shipped:
+        localhostIsLoopback = Boolean.parseBoolean(System.getProperty("com.mongodb.localhostIsLoopback", "false"));
+    }
+
+    private static InetAddress[] _getAddress( String host )
+            throws UnknownHostException {
+
+        if ( host.toLowerCase().equals("localhost") ){
+            if ( localhostIsLoopback )
+                return InetAddress.getAllByName( null );
+            else
+                return new InetAddress[] { InetAddress.getLocalHost() };
+        }
+
+        return InetAddress.getAllByName( host );
+    }
+
     /**
      * Returns the default database host: "127.0.0.1"
      * @return IP address of default host.
@@ -199,7 +228,7 @@ public class ServerAddress {
      * @return true if host resolved to a new IP that is different from old one, false otherwise
      * @throws UnknownHostException
      */
-    boolean updateInetAddress() throws UnknownHostException {
+    public boolean updateInetAddress() throws UnknownHostException {
         InetSocketAddress oldAddress = _address;
         _address = new InetSocketAddress( InetAddress.getByName(_host) , _port );
         return !_address.equals(oldAddress);

@@ -22,15 +22,7 @@ import org.bson.util.annotations.Immutable;
 import org.bson.util.annotations.ThreadSafe;
 
 import java.net.UnknownHostException;
-import java.util.List;
-import java.util.ArrayList;
-import java.util.Set;
-import java.util.HashSet;
-import java.util.Iterator;
-import java.util.LinkedHashMap;
-import java.util.Collections;
-import java.util.Map;
-import java.util.Random;
+import java.util.*;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -420,7 +412,12 @@ public class ReplicaSetStatus extends ConnectionStatus {
     static class ReplicaSetNode extends Node {
         ReplicaSetNode(ServerAddress addr, Set<String> names, String setName, float pingTime, boolean ok, boolean isMaster, boolean isSecondary,
                        LinkedHashMap<String, String> tags, int maxBsonObjectSize) {
-            super(pingTime, addr, maxBsonObjectSize, ok);
+            this(addr, null, names, setName, pingTime, ok, isMaster, isSecondary, tags, maxBsonObjectSize);
+        }
+
+        ReplicaSetNode(ServerAddress addr, ServerAddress altAddr, Set<String> names, String setName, float pingTime, boolean ok, boolean isMaster, boolean isSecondary,
+                       LinkedHashMap<String, String> tags, int maxBsonObjectSize) {
+            super(pingTime, addr, altAddr, maxBsonObjectSize, ok);
             this._names = Collections.unmodifiableSet(new HashSet<String>(names));
             this._setName = setName;
             this._isMaster = isMaster;
@@ -463,6 +460,8 @@ public class ReplicaSetStatus extends ConnectionStatus {
         public String toJSON(){
             StringBuilder buf = new StringBuilder();
             buf.append( "{ address:'" ).append( _addr ).append( "', " );
+            if ( _altAddr != null )
+                buf.append( "altAddress:'" ).append( _altAddr ).append( "', " );
             buf.append( "ok:" ).append( _ok ).append( ", " );
             buf.append( "ping:" ).append( _pingTime ).append( ", " );
             buf.append( "isMaster:" ).append( _isMaster ).append( ", " );
@@ -494,7 +493,7 @@ public class ReplicaSetStatus extends ConnectionStatus {
             if (_isSecondary != node._isSecondary) return false;
             if (_ok != node._ok) return false;
             if (Float.compare(node._pingTime, _pingTime) != 0) return false;
-            if (!_addr.equals(node._addr)) return false;
+            if (!isHavingSameAddrs(node)) return false;
             if (!_names.equals(node._names)) return false;
             if (!_tags.equals(node._tags)) return false;
             if (!_setName.equals(node._setName)) return false;
@@ -505,6 +504,7 @@ public class ReplicaSetStatus extends ConnectionStatus {
         @Override
         public int hashCode() {
             int result = _addr.hashCode();
+            result = 31 * result + (_altAddr == null ? 0 : _altAddr.hashCode());
             result = 31 * result + (_pingTime != +0.0f ? Float.floatToIntBits(_pingTime) : 0);
             result = 31 * result + _names.hashCode();
             result = 31 * result + _tags.hashCode();
@@ -588,37 +588,117 @@ public class ReplicaSetStatus extends ConnectionStatus {
                                 Mongo mongo,
                                 MongoOptions mongoOptions,
                                 AtomicReference<String> lastPrimarySignal) {
-            super(addr, mongo, mongoOptions);
+            this(addr, null, all, logger, mongo, mongoOptions, lastPrimarySignal);
+        }
+
+        UpdatableReplicaSetNode(ServerAddress addr,
+                                ServerAddress altAddr,
+                                List<UpdatableReplicaSetNode> all,
+                                AtomicReference<Logger> logger,
+                                Mongo mongo,
+                                MongoOptions mongoOptions,
+                                AtomicReference<String> lastPrimarySignal) {
+            super(addr, altAddr, mongo, mongoOptions);
             _all = all;
             _names.add(addr.toString());
             _logger = logger;
             _lastPrimarySignal = lastPrimarySignal;
         }
 
-        private void updateAddr() {
+        private ServerAddress myMeAddr( CommandResult isMasterResult ) {
             try {
-                if (_addr.updateInetAddress()) {
-                    // address changed, need to use new ports
-                    _port = new DBPort(_addr, null, _mongoOptions);
-                    _mongo.getConnector().updatePortPool(_addr);
-                    _logger.get().log(Level.INFO, "Address of host " + _addr.toString() + " changed to " + _addr.getSocketAddress().toString());
+                if ( isMasterResult != null && isMasterResult.ok() )
+                    return new ServerAddress( isMasterResult.getString( "me" ) );
+            } catch (Exception e) {
+                // meh.
+            }
+            return _addr;
+        }
+
+        private void updateAddr() {
+            ServerAddress addy = getServerAddress();
+            try {
+                if ( addy.updateInetAddress() ) {
+                    updateAddrForReal();
                 }
             } catch (UnknownHostException ex) {
                 _logger.get().log(Level.WARNING, null, ex);
             }
         }
 
-        void update(Set<UpdatableReplicaSetNode> seenNodes) {
-            CommandResult res = update();
+        private void updateAddrForReal() {
+            ServerAddress addy = getServerAddress();
+            // address changed, we've been given to understand; need to use new ports
+            _port = new DBPort( addy, null, _mongoOptions );
+            _mongo.getConnector().updatePortPool( addy );
+            _logger.get().log( Level.INFO, "Address of host " + getHostAddrDesc() + " changed to " +
+                                           addy.getSocketAddress().toString() );
+        }
+
+        private void updateAltAddrMaybe( ServerAddress altAddy ) {
+            if ( ! altAddy.equals( _altAddr ) ) {
+                _altAddr = altAddy;
+                updateAddrForReal();
+            }
+        }
+
+        /**
+         *
+         * @param seenNodes starts empty, and accrues all the nodes that each node has seen as this method is called
+         *                  on each node in turn.  however, each of those other nodes will have to wait until it is
+         *                  itself visited before it can be annotated with its _altAddr tag (if any).
+         *                  If seenNodes is nonNull, it is because self is a member of seenNodes already.
+         */
+        void update( Set<UpdatableReplicaSetNode> seenNodes,
+                     CommandResult isMasterResult,
+                     Map<ServerAddress,ServerAddress> altAddrProj )
+        {
+            if ( altAddrProj != null && altAddrProj.containsKey( _addr ) ) {
+                this.updateAltAddrMaybe( altAddrProj.get( _addr ) ); // ==> a new _port just in time to use below...
+            }
+            if ( altAddrProj != null && altAddrProj.containsValue( _addr ) ) {
+                ServerAddress nominalAddr = keyForValue( altAddrProj, _addr );
+                UpdatableReplicaSetNode node = _addIfNotHere( nominalAddr.toString() );
+                if ( node != null && seenNodes != null ) {
+                    node.updateAltAddrMaybe( _addr );
+                    seenNodes.add( node );
+                }
+            }
+
+            CommandResult res = isMasterResult;
+            if ( res == null ) {
+                if ( seenNodes != null ) {
+                    final String wow = "Newly discovered server!  Check it: " + getHostAddrDesc();
+                    _logger.get().log( Level.INFO, wow );
+                }
+                res = update();
+            }
             if (res == null || !_ok) {
                 return;
             }
 
             _isMaster = res.getBoolean("ismaster", false);
             _isSecondary = res.getBoolean("secondary", false);
-            _lastPrimarySignal.set(res.getString("primary"));
+            _lastPrimarySignal.set(res.getString("primary"));  // N.B. - the *nominal* server name, as per rs.conf()
 
-            if (res.containsField("hosts")) {
+            // Tags were added in 2.0 but may not be present
+            if (res.containsField("tags")) {
+                DBObject tags = (DBObject) res.get("tags");
+                for (String key : tags.keySet()) {
+                    _tags.put(key, tags.get(key).toString());
+                    if ( key.equals( alternateAddressTagName ) ) { // a hack by MongoLab.  you're welcome.  :)
+                        String altAddrString = tags.get( key ).toString();
+                        try {
+                            updateAltAddrMaybe( new ServerAddress( altAddrString ) );
+                        } catch ( UnknownHostException e ) {
+                            String msg = "Unable to set alternate address [" + altAddrString + "]";
+                            getLogger().log( Level.WARNING, msg, e );
+                        }
+                    }
+                }
+            }
+
+            if (res.containsField("hosts")) {                // N.B. - all *nominal* server names, as per rs.conf()
                 for (Object x : (List) res.get("hosts")) {
                     String host = x.toString();
                     UpdatableReplicaSetNode node = _addIfNotHere(host);
@@ -627,20 +707,12 @@ public class ReplicaSetStatus extends ConnectionStatus {
                 }
             }
 
-            if (res.containsField("passives")) {
+            if (res.containsField("passives")) {             // N.B. - all *nominal* server names, as per rs.conf()
                 for (Object x : (List) res.get("passives")) {
                     String host = x.toString();
                     UpdatableReplicaSetNode node = _addIfNotHere(host);
                     if (node != null && seenNodes != null)
                         seenNodes.add(node);
-                }
-            }
-
-            // Tags were added in 2.0 but may not be present
-            if (res.containsField("tags")) {
-                DBObject tags = (DBObject) res.get("tags");
-                for (String key : tags.keySet()) {
-                    _tags.put(key, tags.get(key).toString());
                 }
             }
 
@@ -658,6 +730,11 @@ public class ReplicaSetStatus extends ConnectionStatus {
             return _logger.get();
         }
 
+        /**
+         * If it's not already known, creates and adds to _all a node based on
+         * @param host -- a *nominal* host address string, as seen in rs.conf().
+         * @return the node found or created for host
+         */
         UpdatableReplicaSetNode _addIfNotHere(String host) {
             UpdatableReplicaSetNode n = findNode(host, _all, _logger);
             if (n == null) {
@@ -671,6 +748,9 @@ public class ReplicaSetStatus extends ConnectionStatus {
             return n;
         }
 
+        /**
+         * find a node based on *nominal* host address string, as seen in rs.conf().
+         */
         private UpdatableReplicaSetNode findNode(String host, List<UpdatableReplicaSetNode> members, AtomicReference<Logger> logger) {
             for (UpdatableReplicaSetNode node : members)
                 if (node._names.contains(host))
@@ -759,9 +839,16 @@ public class ReplicaSetStatus extends ConnectionStatus {
 
         public synchronized void updateAll(){
             HashSet<UpdatableReplicaSetNode> seenNodes = new HashSet<UpdatableReplicaSetNode>();
+            Map<ServerAddress,CommandResult> allsIsMasterRunned = allRunIsMasterCmd();
+            Map<ServerAddress,ServerAddress> altAddrProj = makeAltAddrProjection( allsIsMasterRunned );
 
-            for (int i = 0; i < _all.size(); i++) {
-                _all.get(i).update(seenNodes);
+            for ( int i=0; i<_all.size(); i++ ){
+                UpdatableReplicaSetNode n = _all.get(i);
+                // _all membership often changes during this loop, so ...
+                CommandResult isMasterResult = ( allsIsMasterRunned.containsKey( n._addr ) ?
+                                                 allsIsMasterRunned.get( n._addr ) :
+                                                 null );
+                n.update( seenNodes, isMasterResult, altAddrProj );
             }
 
             if (seenNodes.size() > 0) {
@@ -775,10 +862,31 @@ public class ReplicaSetStatus extends ConnectionStatus {
             }
         }
 
+        Map<ServerAddress,CommandResult> allRunIsMasterCmd() {
+            Map<ServerAddress,CommandResult> result = new HashMap<ServerAddress, CommandResult>( _all.size() );
+            for ( UpdatableNode n : _all ) {
+                result.put( n._addr, n.update() );
+            }
+            return result;
+        }
+
+        synchronized Map<ServerAddress,ServerAddress> makeAltAddrProjection( Map<ServerAddress,CommandResult> isMasterResults) {
+            Map<ServerAddress,ServerAddress> result = new HashMap<ServerAddress, ServerAddress>( _all.size() );
+            for ( UpdatableReplicaSetNode n : _all ) {
+                ServerAddress nominalAddr = n.myMeAddr( isMasterResults.get( n._addr ) );
+                if ( ! nominalAddr.equals( n._addr ) ) {
+                    // Houston, we have a projection!
+                    result.put( nominalAddr, n._addr );
+                }
+            }
+            return result.size() > 0 ? result : null ;
+        }
+
         private List<ReplicaSetNode> createNodeList() {
             List<ReplicaSetNode> nodeList = new ArrayList<ReplicaSetNode>(_all.size());
             for (UpdatableReplicaSetNode cur : _all) {
-                nodeList.add(new ReplicaSetNode(cur._addr, cur._names, cur._setName, cur._pingTimeMS, cur._ok, cur._isMaster, cur._isSecondary, cur._tags, cur._maxBsonObjectSize));
+                nodeList.add(new ReplicaSetNode(cur._addr, cur._altAddr, cur._names, cur._setName, cur._pingTimeMS,
+                                                cur._ok, cur._isMaster, cur._isSecondary, cur._tags, cur._maxBsonObjectSize));
             }
             return nodeList;
         }
@@ -826,7 +934,7 @@ public class ReplicaSetStatus extends ConnectionStatus {
     List<ServerAddress> getServerAddressList() {
         List<ServerAddress> addrs = new ArrayList<ServerAddress>();
         for (ReplicaSetNode node : _replicaSetHolder.get().getAll())
-            addrs.add(node.getServerAddress());
+            addrs.add(node.getNominalServerAddress());
         return addrs;
     }
 
@@ -848,10 +956,20 @@ public class ReplicaSetStatus extends ConnectionStatus {
     private final AtomicReference<String> _lastPrimarySignal = new AtomicReference<String>();
     final static int slaveAcceptableLatencyMS;
     final static int inetAddrCacheMS;
+    final static String alternateAddressTagName;
 
     static {
         slaveAcceptableLatencyMS = Integer.parseInt(System.getProperty("com.mongodb.slaveAcceptableLatencyMS", "15"));
-        inetAddrCacheMS = Integer.parseInt(System.getProperty("com.mongodb.inetAddrCacheMS", "300000"));
+        inetAddrCacheMS = Integer.parseInt( System.getProperty( "com.mongodb.inetAddrCacheMS", "300000" ) );
+        alternateAddressTagName = System.getProperty( "com.mongodb.memberAltAddressTag", "altAddress" );
+    }
+
+    static <T> T keyForValue( Map<T,T> mappy, T val ) {
+        for ( Map.Entry<T,T> entry : mappy.entrySet() ) {
+            if ( entry.getValue().equals( val ) )
+                return entry.getKey();
+        }
+        return null;
     }
 
 }
