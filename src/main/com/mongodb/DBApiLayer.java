@@ -309,7 +309,7 @@ public class DBApiLayer extends DB {
 
             Response res = _connector.call( _db , this , query , null , 2, readPref, decoder );
 
-            if ( res.size() == 1 ){
+            if ( res.didError() ){
                 BSONObject foo = res.get(0);
                 MongoException e = MongoException.parse( foo );
                 if ( e != null && ! _name.equals( "$cmd" ) )

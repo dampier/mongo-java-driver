@@ -124,8 +124,12 @@ class Response {
         return _cursor;
     }
 
+    public boolean didError() {
+        return ( ( _flags & Bytes.RESULTFLAG_ERRSET ) > 0 );
+    }
+
     public ServerError getError(){
-        if ( _num != 1 )
+        if ( _num != 1 || !didError() )
             return null;
 
         DBObject obj = get(0);
